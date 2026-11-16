@@ -7,11 +7,14 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
 from .config import CONFIG
-from .models import MODELS, resolve_model
+from .models import MODELS, all_models, resolve_model
 from .gemini import generate, generate_stream, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
+from . import bl as bl_state
+
+START_TIME = time.time()
 
 
 def _usage(prompt: str, text: str) -> dict:
@@ -131,14 +134,24 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
-                    for n, c in MODELS.items()
+                    for n, c in all_models().items()
                 ]})
             elif self.path.startswith("/v1beta/models"):
                 self.send_json({"models": [
                     {"name": f"models/{n}", "displayName": n, "description": c["desc"],
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
-                    for n, c in MODELS.items()
+                    for n, c in all_models().items()
                 ]})
+            elif self.path in ("/healthz", "/health"):
+                self.send_json({
+                    "status": "ok",
+                    "version": __version__,
+                    "uptime_sec": int(time.time() - START_TIME),
+                    "auth_mode": "cookie" if CONFIG.get("cookie_file") else "anonymous",
+                    "build_label": bl_state.status(),
+                    "default_model": CONFIG.get("default_model"),
+                    "models": list(all_models().keys()),
+                })
             elif self.path == "/":
                 self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
             else:
@@ -229,6 +242,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Stream error: {e}")
+                # Tell the client instead of ending the SSE stream mid-answer.
+                try:
+                    err = {"error": {"message": f"upstream error: {e}", "type": "upstream_error"}}
+                    self.wfile.write(f"data: {json.dumps(err)}\n\n".encode())
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             return
 
         try:

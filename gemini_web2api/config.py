@@ -2,13 +2,19 @@
 import json
 import os
 
+DEFAULT_BL = "boq_assistant-bard-web-server_20260716.08_p0"
+
 DEFAULT_CONFIG = {
     "port": 8081,
     "host": "0.0.0.0",
     "retry_attempts": 3,
     "retry_delay_sec": 2,
     "request_timeout_sec": 180,
-    "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
+    # "auto" discovers the live label from gemini.google.com (see bl.py);
+    # pin a literal label only when you need to freeze the upstream build.
+    "gemini_bl": "auto",
+    "bl_cache_sec": 3600,
+    "bl_fetch_timeout_sec": 15,
     "auth_user": None,
     "xsrf_token": None,
     "default_model": "gemini-3.6-flash",
@@ -17,7 +23,10 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    # Custom models: {"name": {"mode": 1, "think": 4, "desc": "..."}}
+    "models": {},
 }
+
 
 CONFIG = dict(DEFAULT_CONFIG)
 
