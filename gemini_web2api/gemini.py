@@ -3,6 +3,7 @@ import json
 import time
 import uuid
 import re
+import urllib.error
 import urllib.request
 import urllib.parse
 import ssl
@@ -12,10 +13,44 @@ import hashlib
 try:
     import httpx
     HAS_HTTPX = True
+    HTTPStatusError = httpx.HTTPStatusError
 except ImportError:
     HAS_HTTPX = False
 
+    class HTTPStatusError(Exception):  # pragma: no cover - httpx optional
+        """Placeholder so except-clauses stay importable without httpx."""
+
+        response = None
+
 from .config import CONFIG
+from .bl import get_bl, invalidate as invalidate_bl
+
+#: Google answers with one of these strings instead of content when the request
+#: is rejected upstream (entitlement, model ticket, or a stale build label).
+#: Before this was handled they were returned to clients as normal answers.
+CANNED_MARKERS = (
+    "i seem to be encountering an error",
+    "i encountered an error doing what you asked",
+    "encountered an error doing what you asked",
+    "having a hard time fulfilling your request",
+    "trouble fulfilling your request",
+)
+
+
+class CannedResponse(RuntimeError):
+    """Upstream returned its canned "something went wrong" line instead of an answer."""
+
+
+class StaleBuildError(RuntimeError):
+    """Upstream rejected the request in a way that usually means ``bl`` is outdated."""
+
+
+def is_canned_error(text=None) -> bool:
+    t = (text or "").strip().lower()
+    if not t or len(t) > 400:
+        return False
+    return any(m in t for m in CANNED_MARKERS)
+
 
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
@@ -153,7 +188,7 @@ def _get_url() -> str:
     return (
         f"https://gemini.google.com{account_prefix}/_/BardChatUi/data/"
         "assistant.lamda.BardFrontendService/StreamGenerate"
-        f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
+        f"?bl={get_bl()}&hl=en&_reqid={reqid}&rt=c"
     )
 
 
@@ -193,7 +228,7 @@ def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
     bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
     if bard_err:
-        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
+        raise StaleBuildError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
     last_text = ""
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):
@@ -203,15 +238,19 @@ def extract_response_text(raw: str) -> str:
 
 
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
-    """Non-streaming generation with retry."""
+    """Non-streaming generation with retry.
+
+    A stale ``bl`` or a canned upstream rejection invalidates the cached build
+    label and retries instead of surfacing the rejection as an answer.
+    """
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
-    url = _get_url()
-    headers = _build_headers()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
 
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
+        url = _get_url()
+        headers = _build_headers()
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             if proxy:
@@ -223,7 +262,21 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
-            return extract_response_text(raw)
+            text = extract_response_text(raw)
+            if is_canned_error(text):
+                raise CannedResponse(f"Gemini rejected the request for model {model_id}: {text[:120]}")
+            return text
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in (400, 403, 413):
+                invalidate_bl()
+                log(f"HTTP {e.code} from upstream, refreshed build label (attempt {attempt+1})")
+            elif attempt < CONFIG["retry_attempts"] - 1:
+                time.sleep(CONFIG["retry_delay_sec"])
+        except StaleBuildError as e:
+            last_err = e
+            invalidate_bl()
+            log(f"{e} — refreshed build label (attempt {attempt+1})")
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
@@ -241,13 +294,13 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         return
 
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
-    url = _get_url()
-    headers = _build_headers()
     client = _get_httpx_client()
 
     last_err = None
     emitted_raw_text = ""
     for attempt in range(CONFIG["retry_attempts"]):
+        url = _get_url()
+        headers = _build_headers()
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 resp.raise_for_status()
@@ -263,6 +316,10 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         for t in _extract_texts_from_line(line):
+                            if is_canned_error(t):
+                                raise CannedResponse(
+                                    f"Gemini rejected the request for model {model_id}: {t[:120]}"
+                                )
                             if t == emitted_raw_text or emitted_raw_text.startswith(t):
                                 continue
                             if not t.startswith(emitted_raw_text):
@@ -272,6 +329,15 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             if delta:
                                 yield delta
             return
+        except HTTPStatusError as e:
+            last_err = e
+            status = e.response.status_code if e.response is not None else None
+            if status in (400, 403, 413):
+                invalidate_bl()
+                log(f"HTTP {status} from upstream stream, refreshed build label (attempt {attempt+1})")
+            elif attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:

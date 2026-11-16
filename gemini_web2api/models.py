@@ -1,4 +1,5 @@
 """Model definitions and mapping from Gemini frontend JS source."""
+from .config import CONFIG
 
 # MODE_CATEGORY enum from 028-6eb337387583.js:
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
@@ -43,12 +44,31 @@ MODELS = {
 }
 
 
-def resolve_model(model_name: str, default: str = "gemini-3.6-flash"):
+def all_models() -> dict:
+    """Built-in models merged with ``models`` from config.json (custom entries win)."""
+    merged = dict(MODELS)
+    for name, cfg in (CONFIG.get("models") or {}).items():
+        if not isinstance(cfg, dict) or "mode" not in cfg:
+            continue
+        merged[name] = {
+            "mode": cfg["mode"],
+            "think": cfg.get("think", 4),
+            "desc": cfg.get("desc", "Custom model (config.json)"),
+            **({"extra": cfg["extra"]} if cfg.get("extra") else {}),
+        }
+    return merged
+
+
+def resolve_model(model_name: str, default: str = None):
     """Resolve model name to (name, mode_id, think_mode, error, extra_fields).
 
     Unknown model names fall back to default rather than erroring,
     since upstream clients may request arbitrary model identifiers.
     """
+    models = all_models()
+    default = default or CONFIG.get("default_model") or "gemini-3.6-flash"
+    if default not in models:
+        default = next(iter(models))
     think_override = None
     if "@think=" in model_name:
         model_name, think_str = model_name.rsplit("@think=", 1)
@@ -56,12 +76,12 @@ def resolve_model(model_name: str, default: str = "gemini-3.6-flash"):
             think_override = int(think_str)
         except ValueError:
             return None, None, None, f"Invalid think level: {think_str}", None
-    cfg = MODELS.get(model_name)
+    cfg = models.get(model_name)
     if not cfg:
         from .gemini import log
         log(f"Unknown model '{model_name}', falling back to '{default}'")
         model_name = default
-        cfg = MODELS[default]
+        cfg = models[default]
     mode_id = cfg["mode"]
     think_mode = think_override if think_override is not None else cfg["think"]
     extra = cfg.get("extra")

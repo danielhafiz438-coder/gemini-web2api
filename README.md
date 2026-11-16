@@ -4,6 +4,26 @@
   <img src="logo.png" width="200" alt="gemini-web2api logo">
 </p>
 
+> ### Maintained fork
+> Upstream `Sophomoresty/gemini-web2api` has had no commits since `2bb988b` (14 Aug 2026)
+> while Gemini Web keeps shipping. This fork is the same proxy plus the upkeep it needs
+> to stay usable:
+>
+> - **Build label discovery** — `gemini_bl: "auto"` reads the live `boq_...` label from
+>   `gemini.google.com`, so a Google deploy no longer breaks every request until someone
+>   edits `config.py`. An `HTTP 400` or `BardErrorInfo` response refreshes it and retries.
+> - **Canned-error detection** — when upstream answers *"I seem to be encountering an
+>   error"*, that is retried and reported as an error, instead of being returned to your
+>   client as the model's answer.
+> - **Stream errors are visible** — a failed SSE stream ends with an `error` frame and
+>   `[DONE]` instead of a silently truncated answer.
+> - **Custom models** — declare extra entries under `models` in `config.json`; they appear
+>   in `/v1/models` and resolve like built-ins (see `config.example.json`).
+> - **`GET /healthz`** — version, uptime, resolved build label + source, model list.
+>
+> Install and usage are unchanged: `pip install httpx` then `python gemini_web2api.py`.
+> Pull upstream fixes with `git pull upstream main`.
+
 [中文文档](README_CN.md)
 
 Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, cross-platform, single file.
